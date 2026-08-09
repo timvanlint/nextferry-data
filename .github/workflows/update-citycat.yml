@@ -1,0 +1,164 @@
+name: Update CityCat timetable
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 03:15 UTC every Sunday = 13:15 Brisbane time in AEST.
+    - cron: "15 3 * * 0"
+
+permissions:
+  contents: write
+
+jobs:
+  build-citycat-schedule:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create compact CityCat timetable
+        shell: python
+        run: |
+          import csv
+          import io
+          import json
+          import os
+          import urllib.request
+          import zipfile
+          from datetime import datetime, timezone
+
+          GTFS_URL = "https://gtfsrt.api.translink.com.au/GTFS/SEQ_GTFS.zip"
+          OUTPUT = "data/citycat-schedule.json"
+
+          print("Downloading Translink SEQ GTFS archive...")
+          request = urllib.request.Request(
+              GTFS_URL,
+              headers={"User-Agent": "NextFerry timetable updater/1.0"}
+          )
+
+          with urllib.request.urlopen(request, timeout=180) as response:
+              archive = response.read()
+
+          print(f"Downloaded {len(archive):,} bytes.")
+
+          zf = zipfile.ZipFile(io.BytesIO(archive))
+
+          def csv_reader(name):
+              return csv.DictReader(
+                  io.TextIOWrapper(zf.open(name), encoding="utf-8-sig", newline="")
+              )
+
+          # 1. Identify CityCat routes. CityCat is normally F1.
+          citycat_routes = {}
+
+          for route in csv_reader("routes.txt"):
+              name = (
+                  f"{route.get('route_short_name', '')} "
+                  f"{route.get('route_long_name', '')}"
+              ).lower()
+
+              if (
+                  route.get("route_type") == "4"
+                  and ("f1" in name or "citycat" in name)
+              ):
+                  citycat_routes[route["route_id"]] = True
+
+          if not citycat_routes:
+              raise RuntimeError("No CityCat/F1 route was found in Translink GTFS.")
+
+          print("CityCat route IDs:", ", ".join(citycat_routes.keys()))
+
+          # 2. Keep only trips belonging to CityCat routes.
+          trips = {}
+
+          for trip in csv_reader("trips.txt"):
+              if trip.get("route_id") in citycat_routes:
+                  trips[trip["trip_id"]] = {
+                      "service": trip.get("service_id", ""),
+                      "headsign": trip.get("trip_headsign", ""),
+                  }
+
+          if not trips:
+              raise RuntimeError("No CityCat trips were found.")
+
+          print(f"Keeping {len(trips):,} CityCat trips.")
+
+          # 3. Stream every stop-time row once, retaining CityCat only.
+          by_stop = {}
+          citycat_stop_ids = set()
+          scanned = 0
+          retained = 0
+
+          for stop_time in csv_reader("stop_times.txt"):
+              scanned += 1
+              trip_id = stop_time.get("trip_id", "")
+
+              if trip_id not in trips:
+                  continue
+
+              stop_id = stop_time.get("stop_id", "")
+              departure = stop_time.get("departure_time", "")
+
+              if not stop_id or not departure:
+                  continue
+
+              by_stop.setdefault(stop_id, []).append({
+                  "trip": trip_id,
+                  "departure": departure,
+              })
+
+              citycat_stop_ids.add(stop_id)
+              retained += 1
+
+          print(f"Scanned {scanned:,} stop-time rows; retained {retained:,} CityCat rows.")
+
+          # 4. Retain names only for CityCat terminals.
+          stop_names = {}
+
+          for stop in csv_reader("stops.txt"):
+              stop_id = stop.get("stop_id", "")
+
+              if stop_id in citycat_stop_ids:
+                  stop_names[stop_id] = stop.get("stop_name", stop_id)
+
+          terminals = [
+              {"id": stop_id, "name": stop_names.get(stop_id, stop_id)}
+              for stop_id in by_stop
+          ]
+          terminals.sort(key=lambda terminal: terminal["name"].lower())
+
+          # 5. Retain calendar data, needed to determine today's active services.
+          calendar = list(csv_reader("calendar.txt"))
+
+          try:
+              calendar_dates = list(csv_reader("calendar_dates.txt"))
+          except KeyError:
+              calendar_dates = []
+
+          os.makedirs("data", exist_ok=True)
+
+          schedule = {
+              "generatedAt": datetime.now(timezone.utc).isoformat(),
+              "source": GTFS_URL,
+              "routeIds": list(citycat_routes.keys()),
+              "terminals": terminals,
+              "trips": trips,
+              "byStop": by_stop,
+              "calendar": calendar,
+              "calendarDates": calendar_dates,
+          }
+
+          with open(OUTPUT, "w", encoding="utf-8") as file:
+              json.dump(schedule, file, ensure_ascii=False, separators=(",", ":"))
+
+          size = os.path.getsize(OUTPUT)
+          print(f"Created {OUTPUT}: {size:,} bytes, {len(terminals)} terminals.")
+
+      - name: Commit refreshed timetable if changed
+        run: |
+          git config user.name "NextFerry timetable bot"
+          git config user.email "nextferry-bot@users.noreply.github.com"
+          git add data/citycat-schedule.json
+          git diff --cached --quiet || git commit -m "Update CityCat timetable"
+          git push
